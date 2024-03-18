@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 closure = "0.3.0"
 pulse = { version = "2.28.1", package = "libpulse-binding" }
+serde = { version = "1.0.197", features = ["derive"] }
+toml = "0.8.11"

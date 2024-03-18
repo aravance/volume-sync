@@ -1,9 +1,11 @@
-use core::panic;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::{env, fs};
 
 use closure::closure;
+
 use pulse::callbacks::ListResult;
 use pulse::context::introspect::{Introspector, SinkInfo};
 use pulse::context::subscribe::{InterestMaskSet, Operation};
@@ -11,14 +13,60 @@ use pulse::context::{Context, ContextFlagSet, State};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::proplist::Proplist;
 
+use serde::Deserialize;
+
 type FnSinkHandler = dyn FnMut(ListResult<&SinkInfo>);
 
-const CHAT_SINK_NAME: &str =
-    "alsa_output.usb-Audeze_LLC_Audeze_Maxwell_Dongle_0000000000000000-01.pro-output-0";
-const GAME_SINK_NAME: &str =
-    "alsa_output.usb-Audeze_LLC_Audeze_Maxwell_Dongle_0000000000000000-01.pro-output-1";
+#[derive(Deserialize)]
+struct Config {
+    sinks: Vec<String>,
+}
 
 fn main() {
+    let sink_names = Arc::new(Mutex::new(HashSet::new()));
+    let sink_indices = Arc::new(Mutex::new(HashSet::new()));
+    load_config().map_or_else(
+        || {
+            eprintln!("no config file found: {}", get_config_file());
+        },
+        |config| {
+            let mut set = sink_names.lock().unwrap();
+            for sink in config.sinks {
+                set.insert(sink);
+            }
+        },
+    );
+    start_volume_sync(sink_names, sink_indices);
+}
+
+fn get_config_file() -> String {
+    let dir = match env::var("XDG_CONFIG_HOME") {
+        Ok(v) => v,
+        Err(_) => match env::var("HOME") {
+            Ok(home) => format!("{home}/.config"),
+            Err(_) => {
+                eprintln!("failed to load $HOME var");
+                ".".to_string()
+            }
+        },
+    };
+    format!("{dir}/volume-sync.toml")
+}
+
+fn load_config() -> Option<Config> {
+    let filename = get_config_file();
+    if let Ok(content) = fs::read_to_string(filename) {
+        if let Ok(config) = toml::from_str(&content) {
+            return Some(config);
+        }
+    }
+    None
+}
+
+fn start_volume_sync(
+    sink_names: Arc<Mutex<HashSet<String>>>,
+    sink_indices: Arc<Mutex<HashSet<u32>>>,
+) {
     let mut proplist = Proplist::new().unwrap();
     proplist
         .set_str(pulse::proplist::properties::APPLICATION_NAME, "volume-sync")
@@ -51,11 +99,6 @@ fn main() {
         }
     }
 
-    let sink_names = Rc::new(RefCell::new(HashSet::new()));
-    sink_names.borrow_mut().insert(CHAT_SINK_NAME.to_string());
-    sink_names.borrow_mut().insert(GAME_SINK_NAME.to_string());
-
-    let sink_indices = Rc::new(RefCell::new(HashSet::new()));
     let handler = make_sink_info_handler(sink_names.clone(), sink_indices.clone());
     context.introspect().get_sink_info_list(handler);
 
@@ -70,7 +113,7 @@ fn main() {
                 }
                 Operation::Changed => {
                     println!("Changed({index})");
-                    let s = sink_indices.borrow();
+                    let s = sink_indices.lock().unwrap();
                     if s.contains(&index) {
                         for k in s.iter() {
                             if *k != index {
@@ -82,7 +125,7 @@ fn main() {
                 }
                 Operation::Removed => {
                     println!("Removed({index})");
-                    let mut s = sink_indices.borrow_mut();
+                    let mut s = sink_indices.lock().unwrap();
                     if s.remove(&index) {
                         println!("dropped key");
                     }
@@ -118,15 +161,15 @@ fn sync_volume(introspector: Rc<RefCell<Introspector>>, from: u32, to: u32) {
 }
 
 fn make_sink_info_handler(
-    sink_names: Rc<RefCell<HashSet<String>>>,
-    sink_indices: Rc<RefCell<HashSet<u32>>>,
+    sink_names: Arc<Mutex<HashSet<String>>>,
+    sink_indices: Arc<Mutex<HashSet<u32>>>,
 ) -> Box<FnSinkHandler> {
     Box::new(closure!(
         move sink_indices,
         |result| if let ListResult::Item(sink_info) = result {
             if let Some(name) = &sink_info.name {
-                if sink_names.borrow().contains(name.as_ref()) {
-                    sink_indices.borrow_mut().insert(sink_info.index);
+                if sink_names.lock().unwrap().contains(name.as_ref()) {
+                    sink_indices.lock().unwrap().insert(sink_info.index);
                 }
             }
         }
