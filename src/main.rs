@@ -51,8 +51,12 @@ fn main() {
         }
     }
 
-    let sinks = Rc::new(RefCell::new(HashSet::new()));
-    let handler = make_sink_info_handler(sinks.clone());
+    let sink_names = Rc::new(RefCell::new(HashSet::new()));
+    sink_names.borrow_mut().insert(CHAT_SINK_NAME.to_string());
+    sink_names.borrow_mut().insert(GAME_SINK_NAME.to_string());
+
+    let sink_indices = Rc::new(RefCell::new(HashSet::new()));
+    let handler = make_sink_info_handler(sink_names.clone(), sink_indices.clone());
     context.introspect().get_sink_info_list(handler);
 
     let introspector = Rc::new(RefCell::new(context.introspect()));
@@ -61,12 +65,12 @@ fn main() {
             match o {
                 Operation::New => {
                     println!("New({index})");
-                    let handler = make_sink_info_handler(sinks.clone());
+                    let handler = make_sink_info_handler(sink_names.clone(), sink_indices.clone());
                     introspector.borrow().get_sink_info_by_index(index, handler);
                 }
                 Operation::Changed => {
                     println!("Changed({index})");
-                    let s = sinks.borrow();
+                    let s = sink_indices.borrow();
                     if s.contains(&index) {
                         for k in s.iter() {
                             if *k != index {
@@ -78,10 +82,9 @@ fn main() {
                 }
                 Operation::Removed => {
                     println!("Removed({index})");
-                    let mut s = sinks.borrow_mut();
-                    if s.contains(&index) {
-                        println!("dropping key");
-                        s.remove(&index);
+                    let mut s = sink_indices.borrow_mut();
+                    if s.remove(&index) {
+                        println!("dropped key");
                     }
                 }
             }
@@ -114,13 +117,16 @@ fn sync_volume(introspector: Rc<RefCell<Introspector>>, from: u32, to: u32) {
     );
 }
 
-fn make_sink_info_handler(sinks: Rc<RefCell<HashSet<u32>>>) -> Box<FnSinkHandler> {
+fn make_sink_info_handler(
+    sink_names: Rc<RefCell<HashSet<String>>>,
+    sink_indices: Rc<RefCell<HashSet<u32>>>,
+) -> Box<FnSinkHandler> {
     Box::new(closure!(
-        move sinks,
+        move sink_indices,
         |result| if let ListResult::Item(sink_info) = result {
             if let Some(name) = &sink_info.name {
-                if name == GAME_SINK_NAME || name == CHAT_SINK_NAME {
-                    sinks.borrow_mut().insert(sink_info.index);
+                if sink_names.borrow().contains(name.as_ref()) {
+                    sink_indices.borrow_mut().insert(sink_info.index);
                 }
             }
         }
