@@ -16,15 +16,41 @@ use pulse::proplist::Proplist;
 
 use serde::Deserialize;
 
+use simple_logger::SimpleLogger;
+
 #[derive(Deserialize)]
 struct Config {
     sinks: Vec<String>,
+    log_level: Option<LogLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 #[derive(Debug)]
 struct SinkDetails {
     index: u32,
     name: String,
+}
+
+impl LogLevel {
+    fn to_log_filter(&self) -> log::LevelFilter {
+        match self {
+            LogLevel::Off => log::LevelFilter::Off,
+            LogLevel::Error => log::LevelFilter::Error,
+            LogLevel::Warn => log::LevelFilter::Warn,
+            LogLevel::Info => log::LevelFilter::Info,
+            LogLevel::Debug => log::LevelFilter::Debug,
+            LogLevel::Trace => log::LevelFilter::Trace,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -35,13 +61,21 @@ enum SinkEvent {
 }
 
 fn main() {
+    SimpleLogger::new().init().unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+
     let sink_names = Arc::new(Mutex::new(HashSet::new()));
     let sink_indices = Arc::new(Mutex::new(HashSet::<u32>::new()));
     load_config().map_or_else(
         || {
-            eprintln!("no config file found: {}", get_config_file());
+            log::warn!("no config file found: {}", get_config_file());
         },
         |config| {
+            let log_level = config
+                .log_level
+                .map_or_else(|| log::LevelFilter::Info, |l| l.to_log_filter());
+            log::info!("set log_level to {log_level:?}");
+            log::set_max_level(log_level);
             let mut set = sink_names.lock().unwrap();
             for sink in config.sinks {
                 set.insert(sink);
@@ -55,14 +89,16 @@ fn main() {
     let (sender, receiver) = channel();
     let mut volume_sync = VolumeSync::new(mainloop.clone(), sender);
 
-    println!("starting mainloop");
+    log::info!("starting mainloop");
     mainloop.borrow_mut().lock();
     mainloop
         .borrow_mut()
         .start()
         .expect("failed to start mainloop");
     mainloop.borrow_mut().unlock();
-    volume_sync.connect();
+    volume_sync
+        .connect()
+        .expect("failed to connect volume_sync");
 
     let sinks = volume_sync.get_sinks();
     {
@@ -76,7 +112,7 @@ fn main() {
     }
 
     loop {
-        println!("waiting for event");
+        log::debug!("waiting for event");
         match receiver.recv() {
             Ok(e) => match &e {
                 SinkEvent::New(sink) => {
@@ -98,7 +134,7 @@ fn main() {
                     sink_indices.lock().unwrap().remove(index);
                 }
             },
-            Err(err) => eprintln!("error in receiver: {}", err),
+            Err(err) => log::warn!("error in receiver: {}", err),
         }
     }
 }
@@ -109,7 +145,7 @@ fn get_config_file() -> String {
         Err(_) => match env::var("HOME") {
             Ok(home) => format!("{home}/.config"),
             Err(_) => {
-                eprintln!("failed to load $HOME var");
+                log::error!("failed to load $HOME var");
                 ".".to_string()
             }
         },
@@ -139,7 +175,7 @@ impl VolumeSync {
             return;
         }
 
-        println!("syncing volume from: {from} to: {to}");
+        log::info!("syncing volume: {from} -> {to}");
         self.mainloop.borrow_mut().lock();
         self.context
             .borrow_mut()
@@ -171,28 +207,11 @@ impl VolumeSync {
                 .expect("failed to create context"),
         ));
 
-        println!("connecting context");
+        log::info!("connecting context");
         context
             .borrow_mut()
             .connect(None, ContextFlagSet::NOFLAGS, None)
             .expect("failed to connect context");
-        println!("setting state callback");
-        context
-            .borrow_mut()
-            .set_state_callback(Some(Box::new(closure!(
-                clone mainloop,
-                clone context,
-                || {
-                    println!("got state callback");
-                    let state = unsafe { (*context.as_ptr()).get_state() };
-                    match state {
-                        State::Ready | State::Failed | State::Terminated => unsafe {
-                            (*mainloop.as_ptr()).signal(false);
-                        },
-                        _ => {}
-                    }
-                }
-            ))));
 
         return VolumeSync {
             mainloop,
@@ -201,10 +220,107 @@ impl VolumeSync {
         };
     }
 
+    fn connect(&mut self) -> Result<(), &'static str> {
+        self.mainloop.borrow_mut().lock();
+
+        log::debug!("setting state callback");
+        self.context
+            .borrow_mut()
+            .set_state_callback(Some(Box::new(closure!(
+                clone self.mainloop,
+                clone self.context,
+                || {
+                    log::debug!("got state callback");
+                    let state = unsafe { (*context.as_ptr()).get_state() };
+                    match state {
+                        State::Ready | State::Failed | State::Terminated => {
+                            unsafe { (*mainloop.as_ptr()).signal(false); }
+                        },
+                        _ => {},
+                    }
+                }
+            ))));
+
+        loop {
+            match self.context.borrow().get_state() {
+                State::Ready => {
+                    break;
+                }
+                State::Failed | State::Terminated => {
+                    log::error!("context state failed/terminated, quitting...");
+                    self.mainloop.borrow_mut().unlock();
+                    self.mainloop.borrow_mut().stop();
+                    return Err("failed to get ready context");
+                }
+                _ => {
+                    self.mainloop.borrow_mut().wait();
+                }
+            }
+        }
+        self.context.borrow_mut().set_state_callback(None);
+
+        log::debug!("setting subscribe callback");
+        self.context.borrow_mut().set_subscribe_callback(Some(Box::new(closure!(
+            clone self.sender,
+            clone self.context,
+            |_, op, index| {
+                log::debug!("got subscribe callback");
+                if let Some(o) = op {
+                    match o {
+                        Operation::New => {
+                            log::info!("New({index})");
+                            context
+                                .borrow_mut()
+                                .introspect()
+                                .get_sink_info_by_index(index, closure!(
+                                    clone sender,
+                                    move index,
+                                    |result| {
+                                        if let ListResult::Item(sink_info) = result {
+                                            if let Some(name) = &sink_info.name {
+                                                sender
+                                                    .send(SinkEvent::New(SinkDetails{
+                                                        name: name.to_string(),
+                                                        index: index,
+                                                    }))
+                                                    .expect("failed to send");
+                                            }
+                                        }
+                                    }
+                                ));
+                        }
+                        Operation::Changed => {
+                            log::info!("Changed({index})");
+                            sender.send(SinkEvent::Changed(index)).expect("failed to send new event");
+                        }
+                        Operation::Removed => {
+                            log::info!("Removed({index})");
+                            sender.send(SinkEvent::Removed(index)).expect("failed to send new event");
+                        }
+                    }
+                }
+            }
+        ))));
+
+        log::info!("subscribing to sink events");
+        self.context
+            .borrow_mut()
+            .subscribe(InterestMaskSet::SINK, |success| {
+                log::debug!("got subscribe context");
+                if !success {
+                    panic!("failed to subscribe context");
+                }
+            });
+
+        self.mainloop.borrow_mut().unlock();
+
+        Ok(())
+    }
+
     fn get_sinks(&self) -> Vec<SinkDetails> {
         let out = Arc::new(Mutex::new(Some(Vec::new())));
         self.mainloop.borrow_mut().lock();
-        println!("get_sink_info_list");
+        log::debug!("get_sink_info_list");
         let op = self
             .context
             .borrow_mut()
@@ -213,7 +329,7 @@ impl VolumeSync {
                 clone self.mainloop,
                 clone out,
                 |result| {
-                    println!("result: {result:?}");
+                    log::debug!("result: {result:?}");
                     if let ListResult::Item(sink_info) = result {
                         if let Some(o) = &mut *out.lock().unwrap() {
                             let name = sink_info.name.as_ref().map_or_else(
@@ -229,7 +345,7 @@ impl VolumeSync {
                     unsafe { (*mainloop.as_ptr()).signal(false); }
                 }
             ));
-        println!("watch for state");
+        log::debug!("watch for state");
         loop {
             match op.get_state() {
                 pulse::operation::State::Running => self.mainloop.borrow_mut().wait(),
@@ -239,76 +355,5 @@ impl VolumeSync {
         }
         self.mainloop.borrow_mut().unlock();
         return out.lock().unwrap().take().unwrap();
-    }
-
-    fn connect(&mut self) {
-        self.mainloop.borrow_mut().lock();
-
-        loop {
-            match self.context.borrow().get_state() {
-                State::Ready => {
-                    break;
-                }
-                State::Failed | State::Terminated => {
-                    eprintln!("context state failed/terminated, quitting...");
-                    self.mainloop.borrow_mut().unlock();
-                    self.mainloop.borrow_mut().stop();
-                    return;
-                }
-                _ => {
-                    self.mainloop.borrow_mut().wait();
-                }
-            }
-        }
-        self.context.borrow_mut().set_state_callback(None);
-
-        println!("setting subscribe callback");
-        self.context.borrow_mut().set_subscribe_callback(Some(Box::new(closure!(
-            clone self.sender,
-            clone self.context,
-            |_, op, index| {
-                println!("got subscribe callback");
-                if let Some(o) = op {
-                    match o {
-                        Operation::New => {
-                            println!("New({index})");
-                            context.borrow_mut().introspect().get_sink_info_by_index(index, closure!(
-                                clone sender,
-                                move index,
-                                |result| {
-                                    if let ListResult::Item(sink_info) = result {
-                                        if let Some(name) = &sink_info.name {
-                                            sender.send(SinkEvent::New(SinkDetails{
-                                                name: name.to_string(),
-                                                index: index,
-                                            })).expect("failed to send");
-                                        }
-                                    }
-                                }));
-                        }
-                        Operation::Changed => {
-                            println!("Changed({index})");
-                            sender.send(SinkEvent::Changed(index)).expect("failed to send new event");
-                        }
-                        Operation::Removed => {
-                            println!("Removed({index})");
-                            sender.send(SinkEvent::Removed(index)).expect("failed to send new event");
-                        }
-                    }
-                }
-            }
-        ))));
-
-        println!("subscribing context");
-        self.context
-            .borrow_mut()
-            .subscribe(InterestMaskSet::SINK, |success| {
-                println!("got subscribe context");
-                if !success {
-                    panic!("failed to subscribe context");
-                }
-            });
-
-        self.mainloop.borrow_mut().unlock();
     }
 }
