@@ -1,30 +1,42 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::rc::Rc;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
 use closure::closure;
 
 use pulse::callbacks::ListResult;
-use pulse::context::introspect::{Introspector, SinkInfo};
 use pulse::context::subscribe::{InterestMaskSet, Operation};
 use pulse::context::{Context, ContextFlagSet, State};
-use pulse::mainloop::standard::{IterateResult, Mainloop};
+use pulse::mainloop::threaded::Mainloop;
 use pulse::proplist::Proplist;
 
 use serde::Deserialize;
-
-type FnSinkHandler = dyn FnMut(ListResult<&SinkInfo>);
 
 #[derive(Deserialize)]
 struct Config {
     sinks: Vec<String>,
 }
 
+#[derive(Debug)]
+struct SinkDetails {
+    index: u32,
+    name: String,
+}
+
+#[derive(Debug)]
+enum SinkEvent {
+    New(SinkDetails),
+    Changed(u32),
+    Removed(u32),
+}
+
 fn main() {
     let sink_names = Arc::new(Mutex::new(HashSet::new()));
-    let sink_indices = Arc::new(Mutex::new(HashSet::new()));
+    let sink_indices = Arc::new(Mutex::new(HashSet::<u32>::new()));
     load_config().map_or_else(
         || {
             eprintln!("no config file found: {}", get_config_file());
@@ -36,7 +48,59 @@ fn main() {
             }
         },
     );
-    start_volume_sync(sink_names, sink_indices);
+
+    let mainloop = Rc::new(RefCell::new(
+        Mainloop::new().expect("failed to create mainloop"),
+    ));
+    let (sender, receiver) = channel();
+    let mut volume_sync = VolumeSync::new(mainloop.clone(), sender);
+
+    println!("starting mainloop");
+    mainloop.borrow_mut().lock();
+    mainloop
+        .borrow_mut()
+        .start()
+        .expect("failed to start mainloop");
+    mainloop.borrow_mut().unlock();
+    volume_sync.connect();
+
+    let sinks = volume_sync.get_sinks();
+    {
+        let names = sink_names.lock().unwrap();
+        let mut indices = sink_indices.lock().unwrap();
+        for sink in sinks {
+            if names.contains(&sink.name) {
+                indices.insert(sink.index);
+            }
+        }
+    }
+
+    loop {
+        println!("waiting for event");
+        match receiver.recv() {
+            Ok(e) => match &e {
+                SinkEvent::New(sink) => {
+                    let names = sink_names.lock().unwrap();
+                    let mut indices = sink_indices.lock().unwrap();
+                    if names.contains(&sink.name) {
+                        indices.insert(sink.index);
+                    }
+                }
+                SinkEvent::Changed(index) => {
+                    let indices = sink_indices.lock().unwrap();
+                    if indices.contains(&index) {
+                        for i in indices.iter() {
+                            volume_sync.sync_volume(*index, *i);
+                        }
+                    }
+                }
+                SinkEvent::Removed(index) => {
+                    sink_indices.lock().unwrap().remove(index);
+                }
+            },
+            Err(err) => eprintln!("error in receiver: {}", err),
+        }
+    }
 }
 
 fn get_config_file() -> String {
@@ -63,115 +127,188 @@ fn load_config() -> Option<Config> {
     None
 }
 
-fn start_volume_sync(
-    sink_names: Arc<Mutex<HashSet<String>>>,
-    sink_indices: Arc<Mutex<HashSet<u32>>>,
-) {
-    let mut proplist = Proplist::new().unwrap();
-    proplist
-        .set_str(pulse::proplist::properties::APPLICATION_NAME, "volume-sync")
-        .unwrap();
-    let mut mainloop = Mainloop::new().expect("failed to create mainloop");
-    let mut context = Context::new_with_proplist(&mainloop, "volume-sync", &proplist)
-        .expect("failed to create context");
+struct VolumeSync {
+    mainloop: Rc<RefCell<Mainloop>>,
+    context: Rc<RefCell<Context>>,
+    sender: Sender<SinkEvent>,
+}
 
-    context
-        .connect(None, ContextFlagSet::NOFLAGS, None)
-        .expect("failed to connect context");
-    loop {
-        match mainloop.iterate(false) {
-            IterateResult::Quit(_) | IterateResult::Err(_) => {
-                eprintln!("iterate result quit/err, quitting...");
-                return;
-            }
-            IterateResult::Success(_) => {}
+impl VolumeSync {
+    fn sync_volume(&self, from: u32, to: u32) {
+        if from == to {
+            return;
         }
-        match context.get_state() {
-            State::Ready => {
-                println!("context ready");
-                break;
-            }
-            State::Failed | State::Terminated => {
-                eprintln!("context state failed/terminated, quitting...");
-                return;
-            }
-            _ => {}
-        }
+
+        println!("syncing volume from: {from} to: {to}");
+        self.mainloop.borrow_mut().lock();
+        self.context
+            .borrow_mut()
+            .introspect()
+            .get_sink_info_by_index(
+                from,
+                closure!(
+                    clone self.context,
+                    |result| {
+                        if let ListResult::Item(sink_info) = result {
+                            context
+                                .borrow_mut()
+                                .introspect()
+                                .set_sink_volume_by_index(to, &sink_info.volume, None);
+                        }
+                    }
+                ),
+            );
+        self.mainloop.borrow_mut().unlock();
     }
 
-    let handler = make_sink_info_handler(sink_names.clone(), sink_indices.clone());
-    context.introspect().get_sink_info_list(handler);
+    fn new(mainloop: Rc<RefCell<Mainloop>>, sender: Sender<SinkEvent>) -> VolumeSync {
+        let mut proplist = Proplist::new().unwrap();
+        proplist
+            .set_str(pulse::proplist::properties::APPLICATION_NAME, "volume-sync")
+            .unwrap();
+        let context = Rc::new(RefCell::new(
+            Context::new_with_proplist(mainloop.borrow().deref(), "volume-sync", &proplist)
+                .expect("failed to create context"),
+        ));
 
-    let introspector = Rc::new(RefCell::new(context.introspect()));
-    context.set_subscribe_callback(Some(Box::new(closure!(|_, op, index| {
-        if let Some(o) = op {
-            match o {
-                Operation::New => {
-                    println!("New({index})");
-                    let handler = make_sink_info_handler(sink_names.clone(), sink_indices.clone());
-                    introspector.borrow().get_sink_info_by_index(index, handler);
+        println!("connecting context");
+        context
+            .borrow_mut()
+            .connect(None, ContextFlagSet::NOFLAGS, None)
+            .expect("failed to connect context");
+        println!("setting state callback");
+        context
+            .borrow_mut()
+            .set_state_callback(Some(Box::new(closure!(
+                clone mainloop,
+                clone context,
+                || {
+                    println!("got state callback");
+                    let state = unsafe { (*context.as_ptr()).get_state() };
+                    match state {
+                        State::Ready | State::Failed | State::Terminated => unsafe {
+                            (*mainloop.as_ptr()).signal(false);
+                        },
+                        _ => {}
+                    }
                 }
-                Operation::Changed => {
-                    println!("Changed({index})");
-                    let s = sink_indices.lock().unwrap();
-                    if s.contains(&index) {
-                        for k in s.iter() {
-                            if *k != index {
-                                println!("sync volume from:{index} to:{k}");
-                                sync_volume(introspector.clone(), index, *k);
-                            }
+            ))));
+
+        return VolumeSync {
+            mainloop,
+            context,
+            sender,
+        };
+    }
+
+    fn get_sinks(&self) -> Vec<SinkDetails> {
+        let out = Arc::new(Mutex::new(Some(Vec::new())));
+        self.mainloop.borrow_mut().lock();
+        println!("get_sink_info_list");
+        let op = self
+            .context
+            .borrow_mut()
+            .introspect()
+            .get_sink_info_list(closure!(
+                clone self.mainloop,
+                clone out,
+                |result| {
+                    println!("result: {result:?}");
+                    if let ListResult::Item(sink_info) = result {
+                        if let Some(o) = &mut *out.lock().unwrap() {
+                            let name = sink_info.name.as_ref().map_or_else(
+                                || "".to_string(),
+                                |it| it.to_string(),
+                            );
+                            o.push(SinkDetails {
+                                index: sink_info.index,
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                    unsafe { (*mainloop.as_ptr()).signal(false); }
+                }
+            ));
+        println!("watch for state");
+        loop {
+            match op.get_state() {
+                pulse::operation::State::Running => self.mainloop.borrow_mut().wait(),
+                pulse::operation::State::Done => break,
+                pulse::operation::State::Cancelled => break,
+            }
+        }
+        self.mainloop.borrow_mut().unlock();
+        return out.lock().unwrap().take().unwrap();
+    }
+
+    fn connect(&mut self) {
+        self.mainloop.borrow_mut().lock();
+
+        loop {
+            match self.context.borrow().get_state() {
+                State::Ready => {
+                    break;
+                }
+                State::Failed | State::Terminated => {
+                    eprintln!("context state failed/terminated, quitting...");
+                    self.mainloop.borrow_mut().unlock();
+                    self.mainloop.borrow_mut().stop();
+                    return;
+                }
+                _ => {
+                    self.mainloop.borrow_mut().wait();
+                }
+            }
+        }
+        self.context.borrow_mut().set_state_callback(None);
+
+        println!("setting subscribe callback");
+        self.context.borrow_mut().set_subscribe_callback(Some(Box::new(closure!(
+            clone self.sender,
+            clone self.context,
+            |_, op, index| {
+                println!("got subscribe callback");
+                if let Some(o) = op {
+                    match o {
+                        Operation::New => {
+                            println!("New({index})");
+                            context.borrow_mut().introspect().get_sink_info_by_index(index, closure!(
+                                clone sender,
+                                move index,
+                                |result| {
+                                    if let ListResult::Item(sink_info) = result {
+                                        if let Some(name) = &sink_info.name {
+                                            sender.send(SinkEvent::New(SinkDetails{
+                                                name: name.to_string(),
+                                                index: index,
+                                            })).expect("failed to send");
+                                        }
+                                    }
+                                }));
+                        }
+                        Operation::Changed => {
+                            println!("Changed({index})");
+                            sender.send(SinkEvent::Changed(index)).expect("failed to send new event");
+                        }
+                        Operation::Removed => {
+                            println!("Removed({index})");
+                            sender.send(SinkEvent::Removed(index)).expect("failed to send new event");
                         }
                     }
                 }
-                Operation::Removed => {
-                    println!("Removed({index})");
-                    let mut s = sink_indices.lock().unwrap();
-                    if s.remove(&index) {
-                        println!("dropped key");
-                    }
-                }
             }
-        }
-    }))));
-    context.subscribe(InterestMaskSet::SINK, |success| {
-        if !success {
-            panic!("failed to subscribe context");
-        }
-    });
+        ))));
 
-    mainloop.run().expect("failed to run mainloop");
-}
+        println!("subscribing context");
+        self.context
+            .borrow_mut()
+            .subscribe(InterestMaskSet::SINK, |success| {
+                println!("got subscribe context");
+                if !success {
+                    panic!("failed to subscribe context");
+                }
+            });
 
-fn sync_volume(introspector: Rc<RefCell<Introspector>>, from: u32, to: u32) {
-    if from == to {
-        return;
+        self.mainloop.borrow_mut().unlock();
     }
-    introspector.borrow_mut().get_sink_info_by_index(
-        from,
-        closure!(clone introspector, |result| if let ListResult::Item(sink_info) = result {
-            if sink_info.index == from {
-                introspector.borrow_mut().set_sink_volume_by_index(
-                    to,
-                    &sink_info.volume,
-                    None,
-                );
-            }
-        }),
-    );
-}
-
-fn make_sink_info_handler(
-    sink_names: Arc<Mutex<HashSet<String>>>,
-    sink_indices: Arc<Mutex<HashSet<u32>>>,
-) -> Box<FnSinkHandler> {
-    Box::new(closure!(
-        move sink_indices,
-        |result| if let ListResult::Item(sink_info) = result {
-            if let Some(name) = &sink_info.name {
-                if sink_names.lock().unwrap().contains(name.as_ref()) {
-                    sink_indices.lock().unwrap().insert(sink_info.index);
-                }
-            }
-        }
-    ))
 }
