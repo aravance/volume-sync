@@ -1,12 +1,16 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Deref;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
 use closure::closure;
+
+use notify::event::{CreateKind, ModifyKind, RenameMode};
+use notify::{EventKind, RecursiveMode, Watcher};
 
 use pulse::callbacks::ListResult;
 use pulse::context::subscribe::{InterestMaskSet, Operation};
@@ -18,13 +22,22 @@ use serde::Deserialize;
 
 use simple_logger::SimpleLogger;
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Config {
     sinks: Vec<String>,
     log_level: Option<LogLevel>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Config {
+    fn default() -> Config {
+        return Config {
+            sinks: Vec::new(),
+            log_level: Some(LogLevel::Info),
+        };
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 enum LogLevel {
     Off,
     Error,
@@ -41,7 +54,7 @@ struct SinkDetails {
 }
 
 impl LogLevel {
-    fn to_log_filter(&self) -> log::LevelFilter {
+    fn to_level_filter(&self) -> log::LevelFilter {
         match self {
             LogLevel::Off => log::LevelFilter::Off,
             LogLevel::Error => log::LevelFilter::Error,
@@ -54,40 +67,72 @@ impl LogLevel {
 }
 
 #[derive(Debug)]
-enum SinkEvent {
-    New(SinkDetails),
-    Changed(u32),
-    Removed(u32),
+enum VolumeSyncEvent {
+    SinkNew(SinkDetails),
+    SinkChanged(u32),
+    SinkRemoved(u32),
+    ConfigChanged,
 }
 
 fn main() {
     SimpleLogger::new().init().unwrap();
     log::set_max_level(log::LevelFilter::Info);
 
-    let sink_names = Arc::new(Mutex::new(HashSet::new()));
-    let sink_indices = Arc::new(Mutex::new(HashSet::<u32>::new()));
-    load_config().map_or_else(
-        || {
-            log::warn!("no config file found: {}", get_config_file());
-        },
-        |config| {
-            let log_level = config
-                .log_level
-                .map_or_else(|| log::LevelFilter::Info, |l| l.to_log_filter());
-            log::info!("set log_level to {log_level:?}");
-            log::set_max_level(log_level);
-            let mut set = sink_names.lock().unwrap();
-            for sink in config.sinks {
-                set.insert(sink);
+    let sink_indices = Arc::new(Mutex::new(HashSet::new()));
+    let config = Arc::new(Mutex::new(Config::default()));
+    let (sender, receiver) = channel();
+
+    let handle_config_change = |c: Config| {
+        let log_level = c.log_level.unwrap_or(LogLevel::Info);
+        *config.lock().unwrap() = Config {
+            log_level: Some(log_level.clone()),
+            sinks: c.sinks.clone(),
+        };
+        log::debug!("new config: {:?}", config.lock().unwrap());
+        log::info!("set log_level to {log_level:?}");
+        log::set_max_level(log_level.to_level_filter());
+    };
+
+    if let Some(c) = load_config() {
+        handle_config_change(c);
+    } else {
+        log::warn!("no config file found: {}", get_config_file());
+        handle_config_change(Config::default());
+    };
+
+    let mut watcher = notify::recommended_watcher(closure!(
+        clone sender,
+        |res: notify::Result<notify::Event>| match res {
+            Ok(event) => {
+                if event.paths.first().map_or("", |p| p.to_str().expect("failed to get event path")) == get_config_file() {
+                    match event.kind {
+                        EventKind::Create(CreateKind::File)
+                        | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                        | EventKind::Modify(ModifyKind::Data(_)) => {
+                            log::info!("event: {event:?}");
+                            sender.send(VolumeSyncEvent::ConfigChanged).expect("failed to send config event");
+                        }
+                        _ => log::debug!("ignore event: {event:?}"),
+                    }
+                }
             }
-        },
-    );
+            Err(e) => log::error!("error: {e:?}"),
+        }
+    )).expect("failed to create config file watcher");
+    log::info!("starting config file watcher");
+    watcher
+        .watch(
+            Path::new(&get_config_file())
+                .parent()
+                .expect("no parent dir"),
+            RecursiveMode::NonRecursive,
+        )
+        .expect("failed to start config file watcher");
 
     let mainloop = Rc::new(RefCell::new(
         Mainloop::new().expect("failed to create mainloop"),
     ));
-    let (sender, receiver) = channel();
-    let mut volume_sync = VolumeSync::new(mainloop.clone(), sender);
+    let volume_sync = Rc::new(RefCell::new(VolumeSync::new(mainloop.clone(), sender)));
 
     log::info!("starting mainloop");
     mainloop.borrow_mut().lock();
@@ -97,41 +142,54 @@ fn main() {
         .expect("failed to start mainloop");
     mainloop.borrow_mut().unlock();
     volume_sync
+        .borrow_mut()
         .connect()
         .expect("failed to connect volume_sync");
 
-    let sinks = volume_sync.get_sinks();
-    {
-        let names = sink_names.lock().unwrap();
+    let update_sink_indices = || {
+        let sinks = volume_sync.borrow().get_sinks();
+        let cfg = config.lock().unwrap();
         let mut indices = sink_indices.lock().unwrap();
+        indices.clear();
         for sink in sinks {
-            if names.contains(&sink.name) {
+            if cfg.sinks.contains(&sink.name) {
                 indices.insert(sink.index);
             }
         }
-    }
+    };
+    update_sink_indices();
 
     loop {
         log::debug!("waiting for event");
         match receiver.recv() {
             Ok(e) => match &e {
-                SinkEvent::New(sink) => {
-                    let names = sink_names.lock().unwrap();
+                VolumeSyncEvent::SinkNew(sink) => {
+                    let names = &config.lock().unwrap().sinks;
                     let mut indices = sink_indices.lock().unwrap();
                     if names.contains(&sink.name) {
                         indices.insert(sink.index);
                     }
                 }
-                SinkEvent::Changed(index) => {
+                VolumeSyncEvent::SinkChanged(index) => {
                     let indices = sink_indices.lock().unwrap();
                     if indices.contains(&index) {
                         for i in indices.iter() {
-                            volume_sync.sync_volume(*index, *i);
+                            volume_sync.borrow().sync_volume(*index, *i);
                         }
                     }
                 }
-                SinkEvent::Removed(index) => {
+                VolumeSyncEvent::SinkRemoved(index) => {
                     sink_indices.lock().unwrap().remove(index);
+                }
+                VolumeSyncEvent::ConfigChanged => {
+                    load_config().map_or_else(
+                        || {
+                            log::warn!("no config file found: {}", get_config_file());
+                        },
+                        handle_config_change,
+                    );
+                    log::debug!("fetch sinks");
+                    update_sink_indices();
                 }
             },
             Err(err) => log::warn!("error in receiver: {}", err),
@@ -166,7 +224,7 @@ fn load_config() -> Option<Config> {
 struct VolumeSync {
     mainloop: Rc<RefCell<Mainloop>>,
     context: Rc<RefCell<Context>>,
-    sender: Sender<SinkEvent>,
+    sender: Sender<VolumeSyncEvent>,
 }
 
 impl VolumeSync {
@@ -197,7 +255,7 @@ impl VolumeSync {
         self.mainloop.borrow_mut().unlock();
     }
 
-    fn new(mainloop: Rc<RefCell<Mainloop>>, sender: Sender<SinkEvent>) -> VolumeSync {
+    fn new(mainloop: Rc<RefCell<Mainloop>>, sender: Sender<VolumeSyncEvent>) -> VolumeSync {
         let mut proplist = Proplist::new().unwrap();
         proplist
             .set_str(pulse::proplist::properties::APPLICATION_NAME, "volume-sync")
@@ -279,7 +337,7 @@ impl VolumeSync {
                                         if let ListResult::Item(sink_info) = result {
                                             if let Some(name) = &sink_info.name {
                                                 sender
-                                                    .send(SinkEvent::New(SinkDetails{
+                                                    .send(VolumeSyncEvent::SinkNew(SinkDetails{
                                                         name: name.to_string(),
                                                         index: index,
                                                     }))
@@ -291,11 +349,11 @@ impl VolumeSync {
                         }
                         Operation::Changed => {
                             log::info!("Changed({index})");
-                            sender.send(SinkEvent::Changed(index)).expect("failed to send new event");
+                            sender.send(VolumeSyncEvent::SinkChanged(index)).expect("failed to send new event");
                         }
                         Operation::Removed => {
                             log::info!("Removed({index})");
-                            sender.send(SinkEvent::Removed(index)).expect("failed to send new event");
+                            sender.send(VolumeSyncEvent::SinkRemoved(index)).expect("failed to send new event");
                         }
                     }
                 }
