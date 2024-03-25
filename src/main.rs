@@ -23,6 +23,16 @@ use serde::Deserialize;
 use simple_logger::SimpleLogger;
 
 #[derive(Clone, Debug, Deserialize)]
+enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct Config {
     sinks: Vec<String>,
     log_level: Option<LogLevel>,
@@ -35,16 +45,6 @@ impl Config {
             log_level: Some(LogLevel::Info),
         };
     }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-enum LogLevel {
-    Off,
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
 }
 
 #[derive(Debug)]
@@ -182,12 +182,12 @@ fn main() {
                     sink_indices.lock().unwrap().remove(index);
                 }
                 VolumeSyncEvent::ConfigChanged => {
-                    load_config().map_or_else(
-                        || {
-                            log::warn!("no config file found: {}", get_config_file());
-                        },
-                        handle_config_change,
-                    );
+                    if let Some(c) = load_config() {
+                        handle_config_change(c);
+                    } else {
+                        log::warn!("no config file found: {}", get_config_file());
+                        handle_config_change(Config::default());
+                    };
                     log::debug!("fetch sinks");
                     update_sink_indices();
                 }
