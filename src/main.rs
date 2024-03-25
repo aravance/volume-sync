@@ -9,7 +9,7 @@ use std::{env, fs};
 
 use closure::closure;
 
-use notify::event::{CreateKind, ModifyKind, RenameMode};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 
 use pulse::callbacks::ListResult;
@@ -107,7 +107,9 @@ fn main() {
                 if event.paths.first().map_or("", |p| p.to_str().expect("failed to get event path")) == get_config_file() {
                     match event.kind {
                         EventKind::Create(CreateKind::File)
+                        | EventKind::Remove(RemoveKind::File)
                         | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                        | EventKind::Modify(ModifyKind::Name(RenameMode::From))
                         | EventKind::Modify(ModifyKind::Data(_)) => {
                             log::info!("event: {event:?}");
                             sender.send(VolumeSyncEvent::ConfigChanged).expect("failed to send config event");
