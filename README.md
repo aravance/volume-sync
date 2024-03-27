@@ -9,7 +9,7 @@ It uses a config file with the following priority:
 Config options:
 ```
 log_level: Off|Error|Warn|Info|Debug|Trace - default:Info -- log level
-sinks: array\<string\> -- list of sink names to keep in sync
+sinks: array<string> -- list of sink names to keep in sync
 ```
 
 e.g.
