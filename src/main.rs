@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use closure::closure;
 
-use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{ModifyKind, RemoveKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 
 use pulse::mainloop::threaded::Mainloop;
@@ -52,11 +52,10 @@ fn main() {
             Ok(event) => {
                 if event.paths.first().map_or("", |p| p.to_str().expect("failed to get event path")) == config::get_file() {
                     match event.kind {
-                        EventKind::Create(CreateKind::File)
-                        | EventKind::Remove(RemoveKind::File)
-                        | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                        EventKind::Modify(ModifyKind::Name(RenameMode::To))
                         | EventKind::Modify(ModifyKind::Name(RenameMode::From))
-                        | EventKind::Modify(ModifyKind::Data(_)) => {
+                        | EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Remove(RemoveKind::File) => {
                             log::info!("event: {event:?}");
                             sender.send(VolumeSyncEvent::ConfigChanged).expect("failed to send config event");
                         }
